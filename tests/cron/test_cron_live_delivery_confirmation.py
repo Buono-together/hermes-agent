@@ -260,8 +260,9 @@ class TestLiveDeliveryIsAFinalNotification:
         assert metadata["notify"] is True
 
     def test_media_route_metadata_carries_notify(self, tmp_path):
-        media = tmp_path / "report.png"
-        media.write_bytes(b"\x89PNG\r\n\x1a\n")
+        # A PDF, not an image: one short-captioned Telegram image is sent as a single photo bubble.
+        media = tmp_path / "report.pdf"
+        media.write_bytes(b"%PDF-1.4\n")
         sent = []
 
         def fake_send_media(adapter, chat_id, media_files, metadata, loop, job, platform=None):
@@ -300,8 +301,9 @@ class TestNotifyIsConfigurable:
         assert metadata["thread_id"] == "99"  # routing untouched
 
     def test_explicit_false_disables_notify_on_media_route(self, tmp_path):
-        media = tmp_path / "report.png"
-        media.write_bytes(b"\x89PNG\r\n\x1a\n")
+        # A PDF, not an image: one short-captioned Telegram image is sent as a single photo bubble.
+        media = tmp_path / "report.pdf"
+        media.write_bytes(b"%PDF-1.4\n")
         sent = []
 
         def fake_send_media(adapter, chat_id, media_files, metadata, loop, job, platform=None):

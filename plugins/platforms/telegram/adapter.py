@@ -12,6 +12,7 @@ import re
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from hermes_cli import setup_platforms
 
@@ -142,7 +143,8 @@ from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
-    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, _prefix_within_utf16_limit,
+    utf16_len,
 )
 
 # Every refused button tap answers with the same sentence.
@@ -352,6 +354,54 @@ def _strip_mdv2(text: str) -> str:
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
     return cleaned
+
+
+# Telegram Bot API HTML allow-list. Only tags Telegram itself understands count, so prose such as
+# ``x < y`` keeps the MarkdownV2 path; profile report formatters emit this HTML on purpose.
+_TELEGRAM_HTML_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|code|pre|blockquote|tg-emoji)(?:\s+[^<>]*?)?\s*>",
+    re.IGNORECASE)
+_TELEGRAM_CAPTION_MAX_LENGTH = 1024
+
+
+def _contains_supported_telegram_html(text: Optional[str]) -> bool:
+    """Whether ``text`` carries Telegram-supported HTML tags outside Markdown code spans/fences."""
+    if not text:
+        return False
+    outside_code = re.sub(r"`[^`\n]*`", "", re.sub(r"```[\s\S]*?(?:```|$)", "", text))
+    return bool(_TELEGRAM_HTML_TAG_RE.search(outside_code))
+
+
+class _TelegramHTMLTextExtractor(HTMLParser):
+    """Collects the user-visible text of a Telegram HTML payload."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _strip_telegram_html(text: str) -> str:
+    """Drop markup, keeping the decoded visible text (the plain fallback for rejected HTML)."""
+    if not text:
+        return text
+    parser = _TelegramHTMLTextExtractor()
+    try:
+        parser.feed(text)
+        parser.close()
+        return "".join(parser.parts)
+    except Exception:
+        return _html.unescape(re.sub(r"<[^>]*>", "", text))
+
+
+def _telegram_caption_fits(text: Optional[str]) -> bool:
+    """Whether ``text`` fits Telegram's 1024-unit caption cap, measured after HTML entity parsing."""
+    if not text:
+        return True
+    visible = _strip_telegram_html(text) if _contains_supported_telegram_html(text) else text
+    return utf16_len(visible) <= _TELEGRAM_CAPTION_MAX_LENGTH
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -3498,23 +3548,31 @@ class TelegramAdapter(BasePlatformAdapter):
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any]):
-        """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
-        try:
-            return await _await_with_thread_deadline(
-                self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
+    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any], fmt: str = "markdown"):
+        """MarkdownV2 (``fmt="html"``: pre-rendered Telegram HTML) first; on an entity rejection resend as
+        stripped plain text. ``fmt="plain"`` sends the chunk as-is with no parse mode."""
+        def _send(text: str, parse_mode):
+            return _await_with_thread_deadline(
+                self._bot.send_message(text=text, parse_mode=parse_mode, **send_kwargs),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+
+        if fmt == "plain":
+            return await _send(chunk, None)
+        is_html = fmt == "html"
+        try:
+            return await _send(chunk, ParseMode.HTML if is_html else ParseMode.MARKDOWN_V2)
         except Exception as md_error:
-            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            err = str(md_error).lower()
+            if "parse" in err or "markdown" in err or (is_html and any(m in err for m in ("html", "entit", "tag"))):
+                logger.warning(
+                    "[%s] %s parse failed, falling back to plain text: %s", self.name,
+                    "HTML" if is_html else "MarkdownV2", md_error)
+                return await _send(_strip_telegram_html(chunk) if is_html else _strip_mdv2(chunk), None)
             raise
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple, fmt: str = "markdown"):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3535,7 +3593,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs, fmt), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3702,26 +3760,38 @@ class TelegramAdapter(BasePlatformAdapter):
         error_types = self._telegram_error_types()
         chunks: List[str] = []
         delivered: List[str] = []
+        fmt = "markdown"
         try:
-            # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
-            # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
-            if self._should_attempt_rich(content, metadata=metadata):
-                rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
-                if rich_result is not None:
-                    if rich_result.success:
-                        await self._retrigger_typing(chat_id, metadata)
-                    return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                    for chunk in chunks
-               ]
-            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
+            if _contains_supported_telegram_html(content):
+                # Explicit Telegram HTML (profile report formatters) is a rendering contract: sent byte-for-byte
+                # when it fits one message (no rich path, no MarkdownV2 escaping); oversized HTML degrades to its
+                # visible text before chunking so a split cannot sever a tag pair.
+                visible = _strip_telegram_html(content)
+                if utf16_len(visible) <= self.MAX_MESSAGE_LENGTH:
+                    fmt, chunks = "html", [content]
+                else:
+                    fmt, chunks = "plain", self.truncate_message(visible, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            else:
+                # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
+                # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
+                if self._should_attempt_rich(content, metadata=metadata):
+                    rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
+                    if rich_result is not None:
+                        if rich_result.success:
+                            await self._retrigger_typing(chat_id, metadata)
+                        return rich_result
+                chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+                if len(chunks) > 1:
+                    # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
+                    chunks = [
+                        _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
+                        for chunk in chunks
+                   ]
+            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types, fmt)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
-            return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
+            return self._with_partial_send(
+                classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable, fmt=fmt)
 
     def _classify_send_exception(self, e: Exception, error_types: tuple) -> SendResult:
         """The failed ``SendResult`` for an exception escaping the chunk loop. ``retryable`` doubles as
@@ -3744,7 +3814,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _send_chunks(
         self, chat_id: str, chunks: List[str], delivered: List[str], reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]], error_types: tuple) -> SendResult:
+        metadata: Optional[Dict[str, Any]], error_types: tuple, fmt: str = "markdown") -> SendResult:
         """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
         (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
         reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
@@ -3754,11 +3824,11 @@ class TelegramAdapter(BasePlatformAdapter):
         prior = len(delivered)
         for chunk in chunks:
             outcome = await self._send_chunk_with_retries(
-                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types, fmt)
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
-                return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
+                return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered, fmt=fmt)
             msg, used_thread_fallback = outcome
             delivered.append(str(msg.message_id))
         await self._retrigger_typing(chat_id, metadata)
@@ -3769,7 +3839,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _with_partial_send(
-        result: SendResult, undelivered: List[str], delivered: List[str], *, tail_certain: bool = True) -> SendResult:
+        result: SendResult, undelivered: List[str], delivered: List[str], *, tail_certain: bool = True,
+        fmt: str = "markdown") -> SendResult:
         """Mark a split-send failure that happened after earlier chunks landed with the ``partial_overflow``
         contract (the same key ``_edit_overflow_split`` sets and the stream consumer reads), so no caller
         re-sends the already-visible head. ``undelivered`` (the formatted remainder, for
@@ -3783,6 +3854,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if tail_certain and undelivered:
             raw["undelivered_chunks"] = tuple(undelivered)
             raw["delivered_message_ids"] = tuple(delivered)
+            if fmt != "markdown":  # resume must re-send the tail in the format it was rendered for
+                raw["undelivered_chunk_format"] = fmt
         result.raw_response = raw
         return result
 
@@ -3795,18 +3868,20 @@ class TelegramAdapter(BasePlatformAdapter):
         if not undelivered or not self._bot:
             return None
         delivered = list(raw.get("delivered_message_ids") or ())
+        fmt = raw.get("undelivered_chunk_format") or "markdown"
         prior = len(delivered)
         async with self._chat_send_lock(chat_id):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
-                return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
+                return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered, fmt=fmt)
             error_types = self._telegram_error_types()
             try:
-                return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata, error_types)
+                return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata, error_types, fmt)
             except Exception as e:
                 classified = self._classify_send_exception(e, error_types)
                 return self._with_partial_send(
-                    classified, list(undelivered)[len(delivered) - prior:], delivered, tail_certain=classified.retryable)
+                    classified, list(undelivered)[len(delivered) - prior:], delivered, tail_certain=classified.retryable,
+                    fmt=fmt)
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -5219,6 +5294,22 @@ class TelegramAdapter(BasePlatformAdapter):
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
         return caption[:1024] if caption else None
 
+    def _render_photo_caption(self, caption: Optional[str]) -> tuple:
+        """``(text, parse_mode, plain_fallback)`` for a photo caption. Telegram HTML is kept verbatim and
+        markdown is rendered to MarkdownV2 when the visible text fits the 1024-unit cap; an oversized
+        caption becomes plain visible text cut at a UTF-16 boundary (no parse mode, so no torn entities)."""
+        if not caption:
+            return None, None, None
+        is_html = _contains_supported_telegram_html(caption)
+        if _telegram_caption_fits(caption):
+            if is_html:
+                return caption, ParseMode.HTML, _strip_telegram_html(caption)
+            formatted = self.format_message(caption)
+            return formatted, ParseMode.MARKDOWN_V2, _strip_mdv2(formatted)
+        plain = _strip_telegram_html(caption) if is_html else _strip_mdv2(self.format_message(caption))
+        plain = _prefix_within_utf16_limit(plain, _TELEGRAM_CAPTION_MAX_LENGTH)
+        return plain, None, plain
+
     async def _send_voice_bubble(self, audio_file, chat_id, reply_to, metadata, caption, duration_secs):
         """sendVoice with caption variants: MarkdownV2 when it fits 1024 chars, plain fallback when the
         Bot API rejects the entities; anything else is a real error."""
@@ -5385,8 +5476,26 @@ class TelegramAdapter(BasePlatformAdapter):
         compressed = self._compress_image_to_jpeg(image_path)
         actual_path = compressed or image_path
         doc_name = os.path.splitext(os.path.basename(image_path))[0] + ".jpg" if compressed else os.path.basename(image_path)
+        cap_text, cap_mode, cap_plain = self._render_photo_caption(caption)
+        # Fallback lanes send captions without a parse mode, so raw HTML tags must not leak into them.
+        fallback_caption = _strip_telegram_html(caption) if _contains_supported_telegram_html(caption) else caption
+
+        def _photo_kwargs(text: Optional[str], parse_mode) -> Any:
+            return lambda f: {"photo": f, "caption": text, **({"parse_mode": parse_mode} if parse_mode else {})}
 
         async def _photo_failed(e: Exception) -> SendResult:
+            err = str(e).lower()
+            if cap_mode is not None and any(m in err for m in ("parse", "markdown", "html", "entit", "tag")):
+                # Entity rejection: keep the photo bubble and resend the caption as readable plain text.
+                logger.warning(
+                    "[%s] Telegram photo caption parse failed, falling back to plain text: %s", self.name,
+                    _redact_telegram_error_text(e))
+                return await self._send_local_file(
+                    "Image", actual_path, chat_id, reply_to, metadata, "photo", _photo_kwargs(cap_plain, None),
+                    _photo_as_document)
+            return await _photo_as_document(e)
+
+        async def _photo_as_document(e: Exception) -> SendResult:
             error_str = str(e)
             # Dimension errors are expected for valid images Telegram refuses as photos → INFO.
             if "Photo_invalid_dimensions" in error_str or "PHOTO_INVALID_DIMENSIONS" in error_str:
@@ -5398,18 +5507,19 @@ class TelegramAdapter(BasePlatformAdapter):
             # Document has no dimension limit (50MB only); if even that fails, base adapter text.
             try:
                 return await self.send_document(
-                    chat_id=chat_id, file_path=actual_path, caption=caption, file_name=doc_name,
+                    chat_id=chat_id, file_path=actual_path, caption=fallback_caption, file_name=doc_name,
                     reply_to=reply_to, metadata=metadata)
             except Exception as doc_err:
                 logger.error(
                     "[%s] Failed to send Telegram local image as document, falling back to base adapter: %s",
                     self.name, doc_err, exc_info=True)
-                return await super(TelegramAdapter, self).send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
+                return await super(TelegramAdapter, self).send_image_file(
+                    chat_id, image_path, fallback_caption, reply_to, metadata=metadata)
 
         try:
             return await self._send_local_file(
-                "Image", actual_path, chat_id, reply_to, metadata, "photo",
-                lambda f: {"photo": f, "caption": self._caption_1024(caption)}, _photo_failed)
+                "Image", actual_path, chat_id, reply_to, metadata, "photo", _photo_kwargs(cap_text, cap_mode),
+                _photo_failed)
         finally:
             if compressed:
                 with contextlib.suppress(OSError):

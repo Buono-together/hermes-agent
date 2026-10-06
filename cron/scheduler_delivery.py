@@ -1538,9 +1538,8 @@ def _live_send_text(
     return True, False, delivered_message_id
 
 
-def _live_send_media(
-    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list) -> None:
-    """Send extracted media as native attachments with the same routing as the text send."""
+def _routed_media_metadata(t: _TargetDelivery, media_metadata: dict) -> dict:
+    """Media-send metadata plus the relay's logical platform/home identity (relay egress only)."""
     routed_media_metadata = dict(media_metadata or {})
     if t.is_relay:
         routed_media_metadata["_relay_logical_platform"] = t.platform.value
@@ -1550,6 +1549,74 @@ def _live_send_media(
                 routed_media_metadata["user_id"] = logical_home.user_id
             if logical_home.scope_id:
                 routed_media_metadata["scope_id"] = logical_home.scope_id
+    return routed_media_metadata
+
+
+def _telegram_caption_image(t: _TargetDelivery, text_to_send: str, media_files: list) -> Optional[str]:
+    """The image path to deliver as ONE Telegram photo+caption bubble, or None for the text-then-media
+    flow. Only a single image whose text fits Telegram's post-entity caption cap qualifies; the path
+    must pass the same media-path policy as any other attachment."""
+    from gateway.config import Platform
+    if t.platform != Platform.TELEGRAM or not text_to_send or len(media_files) != 1:
+        return None
+    from gateway.delivery import _is_silence_narration
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.telegram.adapter import _telegram_caption_fits
+    if _is_silence_narration(text_to_send) or not _telegram_caption_fits(text_to_send):
+        return None
+    kept = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if len(kept) != 1 or _sched.Path(kept[0][0]).suffix.lower() not in _IMAGE_EXTS:
+        return None
+    return str(kept[0][0])
+
+
+def _live_send_captioned_image(
+    t: _TargetDelivery, image_path: str, caption: str, media_metadata: dict, *,
+    target_errors: list, unverified_targets: list,
+) -> tuple[bool, bool, Any]:
+    """Send a one-image Telegram report as a single photo+caption; ``(adapter_ok, timed_out, message_id)``
+    with the text lane's semantics: an unstarted or refused send falls back to standalone, an in-flight
+    timeout is assumed delivered (a resend would duplicate)."""
+    from agent.async_utils import safe_schedule_threadsafe
+    job = t.job
+    metadata = {**_routed_media_metadata(t, media_metadata), "job_id": job["id"]}
+    future = safe_schedule_threadsafe(
+        t.runtime_adapter.send_image_file(
+            chat_id=t.chat_id, image_path=image_path, caption=caption, metadata=metadata), t.loop)
+    if future is None:
+        target_errors.append("live adapter event loop scheduling failed")
+        return False, False, None
+    try:
+        send_result = future.result(timeout=_script._get_media_send_timeout())
+    except TimeoutError:
+        if future.cancel():
+            msg = f"live adapter captioned image send to {t.where} timed out before the coroutine was dispatched"
+            logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+            target_errors.append(msg)
+            return False, False, None
+        logger.warning(
+            "Job '%s': live adapter captioned image send to %s timed out after dispatch; "
+            "assuming delivered to avoid a duplicate", job["id"], t.where)
+        return True, True, None
+    except Exception as ex:
+        target_errors.append(f"live adapter captioned image send failed: {ex}")
+        raise
+    _evidence_gap: list = []
+    if not _confirm_adapter_delivery(send_result, job["id"], _evidence_gap):
+        err = _result_field(send_result, "error") if send_result is not None else "no response from adapter"
+        msg = f"live adapter captioned image send to {t.where} returned unconfirmed result (error={err})"
+        _warn_live_lane_failure(job, msg, t.is_relay)
+        target_errors.append(msg)
+        return False, False, None
+    if _evidence_gap:
+        unverified_targets.append(t.where)
+    return True, False, _result_field(send_result, "message_id")
+
+
+def _live_send_media(
+    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list) -> None:
+    """Send extracted media as native attachments with the same routing as the text send."""
+    routed_media_metadata = _routed_media_metadata(t, media_metadata)
     _media_errors = _send_media_via_adapter(
         t.runtime_adapter, t.chat_id, media_files, routed_media_metadata or None, t.loop, t.job,
         platform=t.platform,
@@ -1623,12 +1690,19 @@ def _deliver_via_live_adapter(
         # the same platform routing as live messages (Telegram's three-mode topic routing).
         text_to_send = cleaned_text.strip()
         adapter_ok, timed_out, delivered_message_id = True, False, None
+        caption_image = _telegram_caption_image(t, text_to_send, media_files)
         if not text_to_send and not media_files:
             # Fail closed so the run reports the empty payload.
             _note_target_error(
                 job, f"live adapter send skipped (empty text and no media) for {t.where}",
                 target_errors)
             adapter_ok = False
+        elif caption_image is not None:
+            # A one-photo Telegram report is one atomic photo+caption bubble; media is then fully sent.
+            adapter_ok, timed_out, delivered_message_id = _live_send_captioned_image(
+                t, caption_image, text_to_send, media_metadata,
+                target_errors=target_errors, unverified_targets=unverified_targets)
+            media_files = []
         elif text_to_send:
             adapter_ok, timed_out, delivered_message_id = _live_send_text(
                 t, text_to_send, route_thread_id, route_metadata,
