@@ -4715,6 +4715,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await handler(query, data, chat_id)
                 return
         for prefix, handler in (
+            ("dv1:", self._handle_digivice_callback), ("tm1:", self._handle_tentamon_review_callback),
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
@@ -4968,6 +4969,81 @@ class TelegramAdapter(BasePlatformAdapter):
         # Sticky state verbs keep the keyboard so further actions can stack; one-shots strip it (can't fire twice).
         with contextlib.suppress(Exception):
             await query.edit_message_text(text=appended, **({} if is_state_verb else {"reply_markup": None}))
+
+    async def _run_profile_callback_script(
+        self, query, data: str, script_name: str, extra_args: List[str], fail_prefix: str, missing_label: str,
+    ) -> Optional[str]:
+        """Run ``$HERMES_HOME/scripts/<script_name> <data> ...`` for a profile button; returns the
+        script's last stdout line ('' when silent), or None after answering the tap with the failure."""
+        from hermes_constants import get_hermes_home
+        hermes_home = get_hermes_home()
+        script_path = hermes_home / "scripts" / script_name
+        if not script_path.exists():
+            await query.answer(text=f"❌ {missing_label} callback script missing.")
+            logger.error("[%s] %s callback script missing: %s", self.name, missing_label, script_path)
+            return None
+        cmd = [
+            sys.executable, str(script_path), data, *extra_args,
+            "--user-id", str(getattr(query.from_user, "id", "")),
+            "--user-name", str(getattr(query.from_user, "first_name", "User") or "")]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "HERMES_HOME": str(hermes_home)})
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            await query.answer(text=f"❌ {fail_prefix} 시간이 초과됐어요.")
+            logger.error("[%s] %s callback timed out: data=%s", self.name, missing_label, data)
+            return None
+        except Exception as exc:
+            await query.answer(text=f"❌ {fail_prefix} 오류: {str(exc)[:120]}")
+            logger.error("[%s] %s callback exception: %s", self.name, missing_label, exc, exc_info=True)
+            return None
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        label = stdout_text.splitlines()[-1] if stdout_text else ""
+        if proc.returncode != 0:
+            detail = (stderr_text.splitlines()[-1] if stderr_text else label) or f"exit {proc.returncode}"
+            await query.answer(text=f"❌ {fail_prefix} 실패: {detail[:120]}")
+            logger.error(
+                "[%s] %s callback failed: rc=%s data=%s stderr=%s", self.name, missing_label, proc.returncode, data, stderr_text)
+            return None
+        return label
+
+    # DIGIVICE action letter -> reaction on the check-in message ("x" = skipped, "p" = rest day).
+    _DIGIVICE_REACTIONS = {"c": "🔥", "i": "🔥", "l": "🔥", "b": "🔥", "k": "🔥", "d": "🔥", "x": "👎", "p": "😴"}
+
+    async def _handle_digivice_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """``dv1:<nonce>:<action>`` — record a DIGIVICE habit check-in via the profile script."""
+        if not await self._callback_authorized(query, cb, "⛔ You are not authorized to record this check-in."):
+            return
+        message_id = getattr(getattr(query, "message", None), "message_id", "") or ""
+        label = await self._run_profile_callback_script(
+            query, data, "digivice_callback.py",
+            ["--chat-id", str(cb["chat_id"] or ""), "--message-id", str(message_id)], "DIGIVICE 기록", "DIGIVICE")
+        if label is None:
+            return
+        await query.answer(text=(label or "✅ DIGIVICE 기록")[:180])
+        action = data.rsplit(":", 1)[-1]
+        reaction = self._DIGIVICE_REACTIONS.get(action)
+        if reaction and cb["chat_id"] and message_id:
+            await self._set_reaction(str(cb["chat_id"]), str(message_id), reaction, is_big=(action != "x"))
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=None)
+
+    async def _handle_tentamon_review_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """``tm1:<item_id>`` — record a Tentamon morning-review check via the profile script."""
+        if not await self._callback_authorized(query, cb, "⛔ You are not authorized to record this review."):
+            return
+        label = await self._run_profile_callback_script(
+            query, data, "tentamon_review_callback.py", [], "확인 기록", "Tentamon")
+        if label is None:
+            return
+        await query.answer(text=(label or "✓ 확인 기록")[:180])
+        # Item buttons stay active so several items can be checked; only "done" closes the keyboard.
+        if data == "tm1:done":
+            with contextlib.suppress(Exception):
+                await query.edit_message_reply_markup(reply_markup=None)
 
     def _missing_media_path_error(self, label: str, path: str) -> str:
         """File-not-found error for MEDIA delivery; /workspace-style paths often exist only in the sandbox."""
@@ -7092,12 +7168,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         return str(configured).lower() not in {"false", "0", "no"}
 
-    async def _set_reaction(self, chat_id: str, message_id: str, emoji: Optional[str]) -> bool:
-        """Set a single emoji reaction (``None`` clears all bot-set reactions, the documented Bot API way)."""
+    async def _set_reaction(self, chat_id: str, message_id: str, emoji: Optional[str], is_big: bool = False) -> bool:
+        """Set a single emoji reaction (``None`` clears all bot-set reactions, the documented Bot API way);
+        ``is_big`` plays Telegram's large reaction animation."""
         if not self._bot:
             return False
         try:
-            await self._bot.set_message_reaction(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reaction=emoji)
+            await self._bot.set_message_reaction(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reaction=emoji,
+                **({"is_big": True} if is_big else {}))
             return True
         except Exception as e:
             if emoji is None:
