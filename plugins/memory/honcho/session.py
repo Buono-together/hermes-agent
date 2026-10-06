@@ -126,8 +126,16 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
 
         See #69123, #74065.
         """
-        self._honcho = get_honcho_client(self._config)
-        return self._honcho
+        client = get_honcho_client(self._config)
+        if self._honcho is not None and client is not self._honcho:
+            # Slot rebuilt: cached peers/sessions hold the old client, whose bearer no rotation reaches
+            # anymore — drop them so the next access re-resolves on the live client.
+            with self._cache_lock:
+                self._client_generation += 1
+                self._peers_cache.clear()
+                self._sessions_cache.clear()
+        self._honcho = client
+        return client
 
     # ----- SDK object caches (generation-guarded against client rebuilds) -----
 

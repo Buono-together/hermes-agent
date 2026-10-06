@@ -168,6 +168,9 @@ class OAuthCredential:
     scope: str = "write"
     token_type: str = "Bearer"
     consent_peer_name: str | None = None  # transient: set only on a fresh grant, never persisted
+    # Stable identity of this login: minted by install_grant, carried through every rotation, replaced only
+    # by a new login. Refresh tokens rotate on every exchange, so they cannot identify the grant.
+    grant_id: str = ""
 
     @classmethod
     def from_host_block(cls, block: dict[str, Any]) -> "OAuthCredential | None":
@@ -179,7 +182,8 @@ class OAuthCredential:
         if not (refresh and endpoint and client_id):
             return None
         return cls(access, str(refresh), _num(oauth.get("expiresAt", 0), float), str(client_id), str(endpoint),
-                   scope=str(oauth.get("scope", "write")), token_type=str(oauth.get("tokenType", "Bearer")))
+                   scope=str(oauth.get("scope", "write")), token_type=str(oauth.get("tokenType", "Bearer")),
+                   grant_id=str(oauth.get("grantId") or ""))
 
     @classmethod
     def from_token_response(
@@ -195,10 +199,13 @@ class OAuthCredential:
 
     def oauth_block(self) -> dict[str, Any]:
         """The ``oauth`` sub-block to persist (the access token lives in apiKey)."""
-        return {
+        block = {
             "refreshToken": self.refresh_token, "expiresAt": int(self.expires_at), "clientId": self.client_id,
             "tokenEndpoint": self.token_endpoint, "scope": self.scope, "tokenType": self.token_type,
         }
+        if self.grant_id:
+            block["grantId"] = self.grant_id
+        return block
 
     def is_expired(self, *, now: float, skew: float = _REFRESH_SKEW_SECONDS) -> bool:
         """True when the access token is within ``skew`` seconds of expiry."""
@@ -236,10 +243,20 @@ def _exchange_refresh_token(
         detail = " — ".join(p for p in (error, description) if p) or "no error body"
         message = redact_sensitive_text(f"token endpoint returned HTTP {status}: {detail}", force=True)
         raise OAuthRefreshError(message, error=error, permanent=error in _PERMANENT_OAUTH_ERRORS)
-    return OAuthCredential.from_token_response(
+    rotated = OAuthCredential.from_token_response(
         body, now=now, client_id=cred.client_id, token_endpoint=cred.token_endpoint,
         scope=cred.scope, token_type=cred.token_type, what="refresh response",
     )
+    # Grants installed before grant_id existed adopt one on first rotation, derived from the retiring
+    # refresh token so concurrent adopters agree.
+    rotated.grant_id = cred.grant_id or _new_grant_id(cred.refresh_token)
+    return rotated
+
+
+def _new_grant_id(seed: str | None = None) -> str:
+    """A 16-hex grant identity: random for a new login, or derived from ``seed`` (deterministic)."""
+    basis = seed if seed is not None else os.urandom(16).hex()
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 def _exchange_with_retry(cred: OAuthCredential, *, now: float) -> OAuthCredential:
     """Exchange the refresh token, retrying once on transient failure. The retry cannot wait (replay grace
@@ -385,6 +402,7 @@ def install_grant(
     login cannot interleave with a sibling's read-modify-write."""
     now = time.time() if now is None else now
     cred = OAuthCredential.from_token_response(grant, now=now, client_id=client_id, token_endpoint=token_endpoint)
+    cred.grant_id = _new_grant_id()
     with _refresh_lock, _config_refresh_lock(path):
         raw = _read_config_strict(path)
         granted_config = grant.get("config")

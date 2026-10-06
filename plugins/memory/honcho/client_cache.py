@@ -38,9 +38,14 @@ _honcho_json_timeout_memo: dict[str, tuple[int, float | None]] = {}
 
 
 def _fingerprint_basis(block: dict, key_fn) -> str:
-    """OAuth grants hash the REFRESH token (stable across access-token rotation,
-    changes on re-auth/account switch); static keys hash the key itself."""
+    """OAuth grants hash the GRANT id (survives every rotation, changes on re-auth/account switch);
+    grants that predate grantId fall back to the refresh token; static keys hash the key itself.
+    The refresh token alone is NOT stable: it rotates on every exchange, so managers bound an hour
+    apart would key different slots and evict each other's client, stranding their cached SDK
+    objects on a dead bearer."""
     oauth_block = block.get("oauth")
+    if isinstance(oauth_block, dict) and oauth_block.get("grantId"):
+        return f"oauth-grant:{oauth_block['grantId']}"
     if isinstance(oauth_block, dict) and oauth_block.get("refreshToken"):
         return f"oauth:{oauth_block['refreshToken']}"
     key = key_fn()
